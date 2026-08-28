@@ -3261,23 +3261,7 @@ def download_asset(path, local):
     return False
 
 def upload_drive(fp):
-    if not os.path.exists(fp): return None
-    print(f"  Uploading {os.path.basename(fp)}...")
-    cid,cs,rt,fid = (os.environ.get(k) for k in ["OAUTH_CLIENT_ID","OAUTH_CLIENT_SECRET","OAUTH_REFRESH_TOKEN","GOOGLE_DRIVE_FOLDER_ID"])
-    if not all([cid,cs,rt]): return None
-    try: tok=requests.post("https://oauth2.googleapis.com/token",data={"client_id":cid,"client_secret":cs,"refresh_token":rt,"grant_type":"refresh_token"}).json()['access_token']
-    except: return None
-    sz=os.path.getsize(fp); meta={"name":os.path.basename(fp),"mimeType":"video/mp4"}
-    if fid: meta["parents"]=[fid]
-    resp=requests.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable",
-        headers={"Authorization":f"Bearer {tok}","Content-Type":"application/json","X-Upload-Content-Type":"video/mp4","X-Upload-Content-Length":str(sz)},json=meta)
-    if resp.status_code!=200: return None
-    with open(fp,"rb") as f: ur=requests.put(resp.headers["Location"],headers={"Content-Length":str(sz)},data=f)
-    if ur.status_code in [200,201]:
-        fid2=ur.json().get('id')
-        requests.post(f"https://www.googleapis.com/drive/v3/files/{fid2}/permissions",
-            headers={"Authorization":f"Bearer {tok}","Content-Type":"application/json"},json={'role':'reader','type':'anyone'})
-        link=f"https://drive.google.com/file/d/{fid2}/view?usp=sharing"; print(f"  -> {link}"); return link
+    # Google Drive upload disabled in this build - videos go directly to YouTube.
     return None
 
 
@@ -3297,25 +3281,45 @@ def _download_youtube_token(channel):
     token_filename = _YOUTUBE_TOKEN_MAP.get(channel)
     if not token_filename:
         return None
-    # Primary: Kaggle dataset path (tokens uploaded as a Kaggle dataset)
+
+    # Primary: expected Kaggle dataset path
     kaggle_path = Path("/kaggle/input/tokens") / token_filename
     if kaggle_path.exists():
         print(f"  YouTube: found token at {kaggle_path}")
         return kaggle_path
-    # Alternative Kaggle dataset name patterns
-    for dataset_name in ["youtube-tokens", "yt-tokens", "token"]:
-        alt_path = Path(f"/kaggle/input/{dataset_name}") / token_filename
-        if alt_path.exists():
-            print(f"  YouTube: found token at {alt_path}")
-            return alt_path
-    # Local fallback (for testing)
-    local_path = Path(token_filename)
-    if local_path.exists():
-        return local_path
-    alt_local = Path("tokens") / token_filename
-    if alt_local.exists():
-        return alt_local
+
+    # Robust fallback: recursively search the entire /kaggle/input tree.
+    # Kaggle can mount a dataset under a slug-derived folder that differs from
+    # the raw dataset name, or nest files in subdirectories. A recursive scan
+    # finds the token regardless of how the mount is structured.
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.is_dir():
+        try:
+            for found in kaggle_input.rglob(token_filename):
+                if found.is_file():
+                    print(f"  YouTube: found token at {found}")
+                    return found
+        except Exception as e:
+            print(f"  YouTube: error scanning /kaggle/input ({e})")
+
+    # Local fallbacks (for testing)
+    for local in (Path(token_filename), Path("tokens") / token_filename):
+        if local.exists():
+            print(f"  YouTube: found token at {local}")
+            return local
+
+    # Diagnostic: list what IS available so misconfiguration is obvious in logs
     print(f"  YouTube: token file '{token_filename}' not found in any expected location")
+    if kaggle_input.is_dir():
+        try:
+            available = [str(p) for p in kaggle_input.rglob("*.json")][:20]
+            print(f"  YouTube: JSON files present under /kaggle/input: {available or 'none'}")
+            dirs = [str(p) for p in kaggle_input.iterdir()]
+            print(f"  YouTube: /kaggle/input contents: {dirs or 'empty'}")
+        except Exception:
+            pass
+    else:
+        print("  YouTube: /kaggle/input does not exist - dataset was NOT attached to the kernel")
     return None
 
 
@@ -3669,9 +3673,7 @@ except Exception as e:
 o2 = OUTPUT_DIR/f"final_{JOB_ID}_WITH_SUBS.mp4"
 
 if render_video(sentences, audio, ass, logo, o2, keep_verifier=True):
-    update_status(93, "Uploading main video while preparing Shorts...")
-    main_upload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    main_upload_future = main_upload_executor.submit(upload_drive, o2)
+    update_status(93, "Preparing Shorts...")
     msg = "Done!\n"
 
     # ==========================================
@@ -3746,8 +3748,7 @@ if render_video(sentences, audio, ass, logo, o2, keep_verifier=True):
             except Exception as e:
                 print(f"  Shorts: verifier reload failed ({e}); shorts will skip clip verification")
 
-            short_upload_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-            short_uploads = []
+            rendered_shorts = []  # (si) that rendered successfully
             for si, short_audio, asset_future in prepared_shorts:
                 try:
                     assets = asset_future.result()
@@ -3777,34 +3778,20 @@ if render_video(sentences, audio, ass, logo, o2, keep_verifier=True):
                     AI_QUERY_OPTIONS = saved_query_options
 
                 if ok:
-                    short_uploads.append((
-                        si,
-                        short_upload_executor.submit(upload_drive, short_out),
-                    ))
+                    rendered_shorts.append(si)
                 else:
                     print(f"  Short {si+1}: failed after retry, skipping")
                     short_failures.append((si + 1, "render failed after retry"))
 
             # Release verifier memory only after all Shorts have been rendered.
             _release_llava_for_encoding()
-            for si, upload_future in short_uploads:
-                try:
-                    link = upload_future.result()
-                except Exception:
-                    link = None
-                if link:
-                    short_links.append(link)
-                    msg += f"Short {si+1}: {link}\n"
-                else:
-                    short_failures.append((si + 1, "upload failed (render succeeded)"))
-            short_upload_executor.shutdown(wait=True)
 
-            print(f"  Shorts summary: {len(short_links)}/{len(short_scripts)} succeeded")
+            print(f"  Shorts summary: {len(rendered_shorts)}/{len(short_scripts)} rendered")
             if short_failures:
                 print(f"  Shorts failures: {short_failures}")
                 msg += f"({len(short_failures)} short(s) failed - check logs)\n"
 
-            # YouTube upload for shorts
+            # YouTube upload for shorts (direct upload, no Google Drive)
             if YOUTUBE_CHANNEL.strip().lower() not in ("none", ""):
                 for si, sc in enumerate(short_scripts):
                     short_path = OUTPUT_DIR / f"short_{JOB_ID}_{si+1}.mp4"
@@ -3816,18 +3803,15 @@ if render_video(sentences, audio, ass, logo, o2, keep_verifier=True):
                             tags=["shorts", "documentary", "facts", "education"],
                         )
                         if yt_short:
+                            short_links.append(yt_short)
                             msg += f"YouTube Short {si+1}: {yt_short}\n"
         except Exception as e:
             print(f"  Shorts pipeline error: {e}")
 
     if _llava_workers:
         _release_llava_for_encoding()
-    l2 = main_upload_future.result()
-    main_upload_executor.shutdown(wait=True)
-    if l2:
-        msg += f"Video: {l2}\n"
 
-    # YouTube upload (main video)
+    # YouTube upload (main video) - direct upload, no Google Drive
     yt_link = upload_youtube(
         o2,
         title=TOPIC[:100] if MODE == "topic" else f"Video {JOB_ID}",
@@ -3837,7 +3821,7 @@ if render_video(sentences, audio, ass, logo, o2, keep_verifier=True):
     if yt_link:
         msg += f"YouTube: {yt_link}\n"
 
-    update_status(100, msg, "completed", l2)
+    update_status(100, msg, "completed", yt_link)
     print(f"\n  {msg}")
 else:
     update_status(0, "Render failed", "failed")
