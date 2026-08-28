@@ -1,0 +1,186 @@
+name: Universal Video Generator
+
+on:
+  repository_dispatch:
+    types: [trigger-video]
+
+jobs:
+  run-video-factory:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Kaggle API
+        run: pip install kaggle==2.2.4
+
+      - name: Build & Push to Kaggle
+        env:
+          # AUTH
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          
+          # PAYLOAD - COMPLETE WITH ALL NEW FIELDS
+          USER_MODE: ${{ github.event.client_payload.mode }}
+          USER_TOPIC: ${{ github.event.client_payload.topic }}
+          USER_SCRIPT: ${{ github.event.client_payload.script }}
+          USER_DURATION: ${{ github.event.client_payload.duration }}
+          USER_VOICE_PATH: ${{ github.event.client_payload.voice_path }}
+          USER_LOGO_PATH: ${{ github.event.client_payload.logo_path }}
+          USER_JOB_ID: ${{ github.event.client_payload.job_id }}
+          USER_LANGUAGE: ${{ github.event.client_payload.language || 'english' }}
+          
+          # YOUTUBE CHANNEL SELECTION
+          USER_YOUTUBE_CHANNEL: ${{ github.event.client_payload.youtube_channel || 'none' }}
+          
+          # NEW ADVANCED SETTINGS - CRITICAL FIX
+          USER_SUBTITLE_STYLE: ${{ github.event.client_payload.subtitle_style || 'mrbeast_yellow' }}
+          USER_AUDIO_SPEED: ${{ github.event.client_payload.audio_speed || '1.0' }}
+          USER_AUDIO_PITCH: ${{ github.event.client_payload.audio_pitch || '1.0' }}
+          USER_AUDIO_EXAGGERATION: ${{ github.event.client_payload.audio_exaggeration || '0.5' }}
+          
+          # API KEYS
+          GH_PAT: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          GEMINI_KEY: ${{ secrets.GEMINI_API_KEY }} 
+          ASSEMBLY_KEY: ${{ secrets.ASSEMBLYAI_API_KEY }}
+          PEXELS_KEYS: ${{ secrets.PEXELS_KEYS }}
+          PIXABAY_KEYS: ${{ secrets.PIXABAY_KEYS }}
+          OPENROUTER_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_KEY: ${{ secrets.GROQ_API_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          
+          # GOOGLE DRIVE OAUTH
+          OAUTH_CLIENT_ID: ${{ secrets.OAUTH_CLIENT_ID }}
+          OAUTH_CLIENT_SECRET: ${{ secrets.OAUTH_CLIENT_SECRET }}
+          OAUTH_REFRESH_TOKEN: ${{ secrets.OAUTH_REFRESH_TOKEN }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+
+        run: |
+          # 1. Setup Kaggle Auth
+          mkdir -p ~/.kaggle
+          echo "{\"username\":\"$KAGGLE_USERNAME\",\"key\":\"$KAGGLE_KEY\"}" > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+          # 2. Build Python Script (Parameter Replacement) - UPDATED FOR ADVANCED SETTINGS
+          cat <<EOF > builder.py
+          import os
+          with open('generator.py', 'r') as f: content = f.read()
+          
+          # All parameters including new ones
+          replacements = {
+              '{{MODE_PLACEHOLDER}}': os.environ.get('USER_MODE', 'topic'),
+              '{{TOPIC_PLACEHOLDER}}': os.environ.get('USER_TOPIC', ''),
+              '{{SCRIPT_PLACEHOLDER}}': os.environ.get('USER_SCRIPT', ''),
+              '{{DURATION_PLACEHOLDER}}': os.environ.get('USER_DURATION', '3'),
+              '{{VOICE_PATH_PLACEHOLDER}}': os.environ.get('USER_VOICE_PATH', ''),
+              '{{LOGO_PATH_PLACEHOLDER}}': os.environ.get('USER_LOGO_PATH', ''),
+              '{{JOB_ID_PLACEHOLDER}}': os.environ.get('USER_JOB_ID', 'debug_run'),
+              '{{LANGUAGE_PLACEHOLDER}}': os.environ.get('USER_LANGUAGE', 'english'),
+              # YOUTUBE CHANNEL
+              '{{YOUTUBE_CHANNEL_PLACEHOLDER}}': os.environ.get('USER_YOUTUBE_CHANNEL', 'none'),
+              # NEW ADVANCED SETTINGS
+              '{{SUBTITLE_STYLE_PLACEHOLDER}}': os.environ.get('USER_SUBTITLE_STYLE', 'mrbeast_yellow'),
+              '{{AUDIO_SPEED_PLACEHOLDER}}': os.environ.get('USER_AUDIO_SPEED', '1.0'),
+              '{{AUDIO_PITCH_PLACEHOLDER}}': os.environ.get('USER_AUDIO_PITCH', '1.0'),
+              '{{AUDIO_EXAG_PLACEHOLDER}}': os.environ.get('USER_AUDIO_EXAGGERATION', '0.5')
+          }
+          
+          for k, v in replacements.items():
+              safe = str(v).replace('"', '\\"').replace('\\n', ' ')
+              content = content.replace(k, safe)
+          
+          with open('final_script.py', 'w') as f: f.write(content)
+          EOF
+          python builder.py
+
+          # 3. Create Secrets Header (WITH ALL SECRETS)
+          cat <<EOF > config_header.py
+          import os
+          os.environ['GH_PAT'] = '$GH_PAT'
+          os.environ['GEMINI_API_KEY'] = '$GEMINI_KEY'
+          os.environ['ASSEMBLYAI_API_KEY'] = '$ASSEMBLY_KEY'
+          os.environ['PEXELS_KEYS'] = '$PEXELS_KEYS'
+          os.environ['PIXABAY_KEYS'] = '$PIXABAY_KEYS'
+          os.environ['GITHUB_REPOSITORY'] = '$GITHUB_REPOSITORY'
+          os.environ['GITHUB_TOKEN'] = '$GITHUB_TOKEN'
+          
+          # OAuth Secrets for Google Drive
+          os.environ['OAUTH_CLIENT_ID'] = '$OAUTH_CLIENT_ID'
+          os.environ['OAUTH_CLIENT_SECRET'] = '$OAUTH_CLIENT_SECRET'
+          os.environ['OAUTH_REFRESH_TOKEN'] = '$OAUTH_REFRESH_TOKEN'
+          os.environ['GOOGLE_DRIVE_FOLDER_ID'] = '$GOOGLE_DRIVE_FOLDER_ID'
+          os.environ['OPENROUTER_API_KEY'] = '$OPENROUTER_KEY'
+          os.environ['GROQ_API_KEY'] = '$GROQ_KEY'
+          EOF
+          
+          # Combine the header (secrets) with the main script
+          cat config_header.py final_script.py > temp.py && mv temp.py final_script.py
+
+          # 4. Create Kaggle Metadata
+          echo '{
+            "id": "'"$KAGGLE_USERNAME"'/video-factory-titan",
+            "title": "Video Factory Titan",
+            "code_file": "final_script.py",
+            "language": "python",
+            "kernel_type": "script",
+            "is_private": "true",
+            "enable_gpu": "true",
+            "enable_internet": "true",
+            "dataset_sources": ["mudassool746/tokens"],
+            "kernel_sources": [],
+            "competition_sources": []
+          }' > kernel-metadata.json
+
+          # Request Kaggle's NvidiaTeslaT4 machine shape (the current T4 x2
+          # accelerator) instead of accepting the default P100. This requires
+          # a recent Kaggle CLI; the workflow pins the first release containing
+          # the accelerator selector above.
+          kaggle kernels push -p . --accelerator NvidiaTeslaT4
+
+      - name: Wait for Result (Long Polling)
+        run: |
+          echo "Polling Kaggle (Timeout: 6 Hours)..."
+          for i in {1..360}; do
+            OUTPUT=$(kaggle kernels status ${{ secrets.KAGGLE_USERNAME }}/video-factory-titan)
+            echo "$OUTPUT"
+            
+            if [[ "$OUTPUT" == *"complete"* ]]; then
+              echo "✅ Kernel finished successfully!"
+              break
+            elif [[ "$OUTPUT" == *"error"* ]]; then
+              echo "❌ Kernel failed! Check Kaggle logs."
+              exit 1
+            fi
+            
+            echo "Rendering... (Minute $i/360)"
+            sleep 60
+          done
+
+      - name: Download Output
+        continue-on-error: true
+        run: |
+          kaggle kernels output ${{ secrets.KAGGLE_USERNAME }}/video-factory-titan -p ./output
+          mkdir public_video
+          mv ./output/final_video_*.mp4 ./public_video/ || echo "Video likely uploaded to Google Drive directly."
+
+      - name: Backup to Repo
+        uses: peaceiris/actions-gh-pages@v3
+        if: success()
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public_video
+          publish_branch: video-archive
+          force_orphan: false
+          keep_files: true
+          user_name: 'Video Bot'
+          user_email: 'bot@video.com'
+          commit_message: 'Backup Video Render'
