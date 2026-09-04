@@ -576,7 +576,6 @@ def _local_sentence_query_options(sentence_text):
 # request has a bounded output size so the pair stays below the provider's
 # 8,000-TPM organization limit; there is no client-side pacing or waiting.
 _GROQ_MODELS = ("openai/gpt-oss-120b", "openai/gpt-oss-120b")
-_GROQ_FALLBACK_MODEL = "llama-3.1-8b-instant"
 _QUERY_BATCH_MAX_COMPLETION_TOKENS = 2200
 
 
