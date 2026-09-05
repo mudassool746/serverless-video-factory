@@ -576,8 +576,8 @@ def _local_sentence_query_options(sentence_text):
 # request has a bounded output size so the pair stays below the provider's
 # 8,000-TPM organization limit; there is no client-side pacing or waiting.
 _GROQ_MODELS = ("openai/gpt-oss-120b", "openai/gpt-oss-120b")
-_GROQ_FALLBACK_MODEL = "openai/gpt-oss-20b"
-_QUERY_BATCH_MAX_COMPLETION_TOKENS = 2200
+_GROQ_FALLBACK_MODEL = "qwen/qwen3.8-27b"
+_QUERY_BATCH_MAX_COMPLETION_TOKENS = 6000
 
 
 def _make_groq_client(key_index=None):
