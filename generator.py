@@ -576,8 +576,23 @@ def _local_sentence_query_options(sentence_text):
 # request has a bounded output size so the pair stays below the provider's
 # 8,000-TPM organization limit; there is no client-side pacing or waiting.
 _GROQ_MODELS = ("openai/gpt-oss-120b", "openai/gpt-oss-120b")
-_GROQ_FALLBACK_MODEL = "qwen/qwen3.8-27b"
-_QUERY_BATCH_MAX_COMPLETION_TOKENS = 6000
+# No separate fallback model. Large batches caused gpt-oss-120b to refuse with a
+# "too many queries" error object and caused other models to hit a 429
+# "request too large" on output tokens. The real fix is small fixed-size query
+# batches (below), which gpt-oss-120b answers reliably. On a transient
+# key/quota/rate error, _groq_complete already rotates to the next API key and
+# retries on the same model, so a second model is unnecessary.
+_GROQ_FALLBACK_MODEL = ""
+# Sentences are chunked into small batches so no single request asks for too
+# many queries. 25 sentences => 125 queries => ~800 completion tokens, which
+# gpt-oss-120b returns in a few seconds well under the token cap and without
+# the intermittent "request too large" refusal seen on 80+ sentence batches.
+_QUERY_BATCH_SIZE = 25
+# Cap on batches sent to Groq at the same time. Keeps the concurrent token
+# burst under the 8,000-TPM organization limit (each small batch is ~1600
+# prompt + ~800 completion tokens).
+_QUERY_BATCH_CONCURRENCY = 2
+_QUERY_BATCH_MAX_COMPLETION_TOKENS = 2000
 
 
 def _make_groq_client(key_index=None):
@@ -745,14 +760,17 @@ def generate_queries_for_sentences(sentences):
     from groq import Groq
 
     n = len(sentences)
-    midpoint = max(1, (n + 1) // 2)
-    batches = [
-        (0, sentences[:midpoint], _GROQ_MODELS[0]),
-        (midpoint, sentences[midpoint:], _GROQ_MODELS[1]),
-    ]
-    batches = [item for item in batches if item[1]]
-    print(f"  Groq: matching {n} sentences with {len(batches)} parallel batches "
-          f"({_GROQ_MODELS[0]} + {_GROQ_MODELS[1]})...")
+    # Split into small fixed-size batches so no single request asks for too many
+    # queries (which made gpt-oss-120b refuse with a "too large" error object).
+    # Each batch cycles through the configured models for light load spreading.
+    batches = []
+    for start in range(0, n, _QUERY_BATCH_SIZE):
+        chunk = sentences[start:start + _QUERY_BATCH_SIZE]
+        model = _GROQ_MODELS[(start // _QUERY_BATCH_SIZE) % len(_GROQ_MODELS)]
+        batches.append((start, chunk, model))
+    print(f"  Groq: matching {n} sentences in {len(batches)} batches of "
+          f"<= {_QUERY_BATCH_SIZE} ({_GROQ_MODELS[0]}, "
+          f"<= {_QUERY_BATCH_CONCURRENCY} concurrent)...")
 
     def _parse_batch_result(raw_result, batch):
         """Return local sentence index -> cleaned option list."""
@@ -823,7 +841,7 @@ def generate_queries_for_sentences(sentences):
             temperature=0.35,
             model=model,
             max_completion_tokens=_QUERY_BATCH_MAX_COMPLETION_TOKENS,
-            attempts=1,
+            attempts=2,
         )
         parsed = _parse_batch_result(result, batch)
         print(f"  Groq {model}: parsed {len(parsed)}/{len(batch)} batch sentences")
@@ -856,7 +874,8 @@ def generate_queries_for_sentences(sentences):
         return batch_start, parsed
 
     parsed_by_global_index = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(batches)) as executor:
+    max_workers = max(1, min(_QUERY_BATCH_CONCURRENCY, len(batches)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_run_batch, *batch_info) for batch_info in batches]
         for future in concurrent.futures.as_completed(futures):
             try:
@@ -2487,10 +2506,18 @@ def _load_llava():
         # it only skips that one replica and keeps the pipeline running with
         # whatever replicas did load, exactly as before. Override via
         # MINICPM_REPLICAS_PER_GPU if a different GPU tier needs tuning.
+        # Each MiniCPM-V 4.5 int4 replica occupies ~7.6 GB on a 14.56 GB T4
+        # (measured from the run's own [RESOURCE] snapshots). A second replica
+        # on the same GPU needs another ~7.6 GB, which does not fit: the run
+        # logs show the second load climbing to ~13.9 GB before failing with
+        # "Tried to allocate 1.10 GiB ... 976 MB free". Two replicas per T4 is
+        # therefore a guaranteed OOM, and attempting it wastes ~10s per GPU and
+        # fragments VRAM. Default to ONE replica per GPU (2 workers on T4 x2).
+        # A larger GPU tier can still opt into 2 via MINICPM_REPLICAS_PER_GPU.
         try:
-            REPLICAS_PER_GPU = max(1, int(os.environ.get("MINICPM_REPLICAS_PER_GPU", "2")))
+            REPLICAS_PER_GPU = max(1, int(os.environ.get("MINICPM_REPLICAS_PER_GPU", "1")))
         except (TypeError, ValueError):
-            REPLICAS_PER_GPU = 2
+            REPLICAS_PER_GPU = 1
         _MINICPM_SECOND_REPLICA_MIN_FREE_GB = 6.0
         loaded = []
         for gpu_index in range(torch.cuda.device_count()):
