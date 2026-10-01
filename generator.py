@@ -409,8 +409,11 @@ YOUTUBE_CHANNEL = """{{YOUTUBE_CHANNEL_PLACEHOLDER}}"""
 
 GEMINI_KEYS = [k.strip() for k in os.environ.get("GEMINI_API_KEY","").split(",") if k.strip()]
 ASSEMBLY_KEY = os.environ.get("ASSEMBLYAI_API_KEY")
-PEXELS_KEYS = os.environ.get("PEXELS_KEYS","").split(",")
-PIXABAY_KEYS = os.environ.get("PIXABAY_KEYS","").split(",")
+# Multiple stock keys (comma-separated). Whitespace is stripped so
+# "key1, key2" works; a leading space would otherwise break the Pexels
+# Authorization header for that key.
+PEXELS_KEYS = [k.strip() for k in os.environ.get("PEXELS_KEYS","").split(",") if k.strip()]
+PIXABAY_KEYS = [k.strip() for k in os.environ.get("PIXABAY_KEYS","").split(",") if k.strip()]
 # Support multiple Groq API keys (comma-separated). When one key is rate-limited,
 # out of quota, or invalid, the next key is tried automatically.
 GROQ_KEYS = [k.strip() for k in os.environ.get("GROQ_API_KEY","").split(",") if k.strip()]
@@ -1411,25 +1414,93 @@ def _claim_url(url):
         return True
 
 
+# Per-key health for stock providers. Rate-limited keys (429) cool down
+# briefly; rejected keys (401/403, Pixabay "invalid key") are retired for the
+# rest of the run. Keys are only ever logged by position, never by value.
+_STOCK_KEY_COOLDOWN_SECONDS = 60
+_STOCK_KEY_LOCK = threading.Lock()
+_STOCK_KEY_COOL_UNTIL = {}   # (provider, key_index) -> monotonic deadline
+_STOCK_KEY_DEAD = set()      # {(provider, key_index)}
+
+
+def _stock_keys_in_order(provider):
+    """Return [(index, key)] to try: healthy keys shuffled first, then keys
+    still cooling down (soonest first) as a last resort. Dead keys excluded."""
+    keys = PEXELS_KEYS if provider == "pexels" else PIXABAY_KEYS
+    now = time.monotonic()
+    healthy, cooling = [], []
+    with _STOCK_KEY_LOCK:
+        for index, key in enumerate(keys):
+            if (provider, index) in _STOCK_KEY_DEAD:
+                continue
+            until = _STOCK_KEY_COOL_UNTIL.get((provider, index), 0.0)
+            (healthy if until <= now else cooling).append((until, index, key))
+    random.shuffle(healthy)
+    cooling.sort()
+    return [(index, key) for _, index, key in healthy + cooling]
+
+
+def _mark_stock_key(provider, index, total, dead):
+    with _STOCK_KEY_LOCK:
+        if dead:
+            if (provider, index) in _STOCK_KEY_DEAD:
+                return
+            _STOCK_KEY_DEAD.add((provider, index))
+            remaining = total - len([1 for p, _ in _STOCK_KEY_DEAD if p == provider])
+            print(f"    {provider.title()} key #{index + 1} rejected (invalid/forbidden); "
+                  f"retired for this run ({remaining}/{total} keys left)")
+        else:
+            already_cooling = _STOCK_KEY_COOL_UNTIL.get((provider, index), 0.0) > time.monotonic()
+            _STOCK_KEY_COOL_UNTIL[(provider, index)] = (
+                time.monotonic() + _STOCK_KEY_COOLDOWN_SECONDS
+            )
+            if not already_cooling:
+                print(f"    {provider.title()} key #{index + 1} rate-limited; "
+                      f"cooling down {_STOCK_KEY_COOLDOWN_SECONDS}s, trying next key")
+
+
+def _stock_request_with_key_rotation(provider, build_request):
+    """Run one stock API request, rotating through every usable key on
+    rate-limit/auth failures. Returns the 200 response or None."""
+    keys = PEXELS_KEYS if provider == "pexels" else PIXABAY_KEYS
+    for index, key in _stock_keys_in_order(provider):
+        url, kwargs = build_request(key)
+        response = requests.get(url, timeout=_STOCK_API_TIMEOUT, **kwargs)
+        status = response.status_code
+        if status == 200:
+            return response
+        if status == 429:
+            _mark_stock_key(provider, index, len(keys), dead=False)
+            continue
+        invalid_pixabay_key = (
+            provider == "pixabay" and status == 400 and "key" in response.text.lower()
+        )
+        if status in (401, 403) or invalid_pixabay_key:
+            _mark_stock_key(provider, index, len(keys), dead=True)
+            continue
+        # Other errors (5xx, bad query) are not key-specific; another key
+        # would fail the same way, so stop here.
+        return None
+    return None
+
+
 def _search_stock_provider(provider, query, page, orientation):
     """Search one stock provider and return candidate video URLs."""
     try:
         if provider == "pexels":
-            keys = [key for key in PEXELS_KEYS if key]
-            if not keys:
-                return []
-            response = requests.get(
-                "https://api.pexels.com/videos/search",
-                headers={"Authorization": random.choice(keys)},
-                params={
-                    "query": query,
-                    "per_page": 15,
-                    "page": page,
-                    "orientation": orientation,
-                },
-                timeout=_STOCK_API_TIMEOUT,
+            response = _stock_request_with_key_rotation(
+                "pexels",
+                lambda key: ("https://api.pexels.com/videos/search", {
+                    "headers": {"Authorization": key},
+                    "params": {
+                        "query": query,
+                        "per_page": 15,
+                        "page": page,
+                        "orientation": orientation,
+                    },
+                }),
             )
-            if response.status_code != 200:
+            if response is None:
                 return []
 
             urls = []
@@ -1464,20 +1535,18 @@ def _search_stock_provider(provider, query, page, orientation):
             return urls
 
         if provider == "pixabay":
-            keys = [key for key in PIXABAY_KEYS if key]
-            if not keys:
-                return []
-            response = requests.get(
-                "https://pixabay.com/api/videos/",
-                params={
-                    "key": random.choice(keys),
-                    "q": query,
-                    "per_page": 15,
-                    "page": page,
-                },
-                timeout=_STOCK_API_TIMEOUT,
+            response = _stock_request_with_key_rotation(
+                "pixabay",
+                lambda key: ("https://pixabay.com/api/videos/", {
+                    "params": {
+                        "key": key,
+                        "q": query,
+                        "per_page": 15,
+                        "page": page,
+                    },
+                }),
             )
-            if response.status_code != 200:
+            if response is None:
                 return []
 
             urls = []
@@ -1681,16 +1750,210 @@ def _find_verified_normalized_clip(sent, index, orientation, tag=""):
         # children are allowed. Continue to the next query round if available.
 
     print(f"    {orientation.title()} clip {index}: no verified candidate after "
-          f"{_CLIP_QUERY_ROUNDS} query rounds; refusing unsafe/unverified fallback")
+          f"{_CLIP_QUERY_ROUNDS} query rounds"
+          + ("; handing off to Shorts rescue chain" if orientation == "portrait"
+             else "; refusing unsafe/unverified fallback"))
     raise RuntimeError(
         f"No verified {orientation} clip found for sentence position {index + 1} "
         f"after {_CLIP_QUERY_ROUNDS} query rounds; no substitute permitted"
     )
 
 
+# ------------------------------------------------------------------
+# SHORTS "NEVER DISCARD" CLIP RESCUE
+# ------------------------------------------------------------------
+# Portrait stock footage is scarce, so a Short must never be dropped just
+# because no native vertical clip passed verification. Every rescue tier
+# stays on-topic - generic filler (nature/space/etc.) is NEVER used:
+#   1. portrait stock, sentence queries, MiniCPM-verified   (existing path)
+#   2. LANDSCAPE stock, same sentence queries, MiniCPM-verified, converted
+#      to 9:16 with a blurred-background fill (landscape pool is far larger)
+#   3. fresh Groq queries for the sentence, portrait then landscape, verified
+#   4. reuse a clip from the long video that was already MiniCPM-verified
+#      for a sentence of the SAME script, ranked by word overlap with this
+#      sentence (and re-verified against it when possible). Shorts are
+#      written from the long script, so these clips are topic-relevant by
+#      construction - a tech video only ever contributes tech footage.
+#   5. render_short substitutes the nearest verified clip of the same short.
+_SHORT_LANDSCAPE_ROUNDS = 2
+_SHORT_POOL_VERIFY_CANDIDATES = 4
+LONG_CLIP_POOL = []      # [{"path", "text", "queries"}] verified long-video clips
+_LONG_POOL_LOCK = threading.Lock()
+_LONG_POOL_USED = {}     # short tag -> set(pool paths) to avoid repeats in one short
+
+_POOL_STOPWORDS = {
+    "this", "that", "with", "from", "have", "were", "what", "when", "which",
+    "their", "there", "they", "them", "than", "then", "into", "your", "about",
+    "would", "could", "should", "these", "those", "because", "while", "every",
+    "just", "like", "more", "most", "some", "only", "even", "also", "very",
+    "been", "being", "will", "over", "under", "after", "before", "where",
+    "cinematic", "close", "shot", "wide", "aerial", "view",
+    "para", "como", "pero", "esta", "este", "estos", "sobre", "cuando",
+    "donde", "porque", "entre", "tiene", "todo", "todos", "puede",
+}
+
+
+def _content_tokens(text):
+    """Lower-cased content words (len > 3, no stopwords) for relevance ranking."""
+    words = re.findall(r"[a-z\u00e1\u00e9\u00ed\u00f3\u00fa\u00f1\u00fc]+", str(text or "").lower())
+    return {w for w in words if len(w) > 3 and w not in _POOL_STOPWORDS}
+
+
+def _register_long_clip_pool(sentences, clips):
+    """Remember the long video's verified clips so Shorts can reuse them."""
+    pool = []
+    for i, clip in enumerate(clips):
+        if not clip or not os.path.exists(clip):
+            continue
+        queries = []
+        if i < len(AI_QUERY_OPTIONS) and AI_QUERY_OPTIONS[i]:
+            queries = [str(q) for q in AI_QUERY_OPTIONS[i] if q]
+        pool.append({
+            "path": str(clip),
+            "text": sentences[i].get("text", "") if i < len(sentences) else "",
+            "queries": queries,
+        })
+    with _LONG_POOL_LOCK:
+        LONG_CLIP_POOL[:] = pool
+        _LONG_POOL_USED.clear()
+    print(f"  Shorts rescue pool: {len(pool)} verified long-video clips registered")
+
+
+def _try_short_candidate(query, index, tag, duration, source, page):
+    """Fetch one stock candidate (portrait or landscape source), verify it with
+    MiniCPM against the sentence query, and normalize it to 1080x1920."""
+    if source == "portrait":
+        raw = search_and_download_vertical(
+            query, index, duration, tag=tag, verify=False, normalize=False, page=page,
+        )
+    else:
+        # Distinct idx namespace so we never overwrite the long video's
+        # temp/clip_{i}.mp4 files, which the rescue pool relies on.
+        raw = search_and_download(query, f"{tag}L{index}", duration, verify=False, page=page)
+    if not raw:
+        return None
+    try:
+        matches = verify_clip_matches_query(raw, query)
+        print(f"    Short rescue clip {index}: {source} candidate "
+              f"{'PASSED' if matches else 'REJECTED'} for '{query[:60]}'")
+        if not matches:
+            return None
+        normalize = (_normalize_vertical_clip if source == "portrait"
+                     else _normalize_landscape_to_vertical_clip)
+        normalized = normalize(raw, TEMP_DIR / f"clip_s{tag}_{index}.mp4", duration)
+        if normalized and _normalized_duration_is_usable(normalized, duration):
+            return normalized
+        if normalized:
+            try: os.remove(normalized)
+            except OSError: pass
+        return None
+    finally:
+        try: os.remove(raw)
+        except OSError: pass
+
+
+def _short_clip_from_long_pool(sent, index, tag, duration, queries):
+    """Tier 4: convert the most relevant verified long-video clip to 9:16."""
+    with _LONG_POOL_LOCK:
+        pool = [e for e in LONG_CLIP_POOL if os.path.exists(e["path"])]
+        used = set(_LONG_POOL_USED.get(tag, set()))
+    if not pool:
+        print(f"    Short rescue clip {index}: long-video pool is empty")
+        return None
+
+    target = _content_tokens(sent.get("text", "") + " " + " ".join(queries))
+    def _score(entry):
+        overlap = len(target & _content_tokens(entry["text"] + " " + " ".join(entry["queries"])))
+        # Prefer clips this short has not used yet, but relevance dominates.
+        return overlap - (1.5 if entry["path"] in used else 0.0)
+    ranked = sorted(pool, key=_score, reverse=True)
+
+    verify_query = next((q for q in queries if q), "") or sent.get("text", "")[:60]
+    chosen = None
+    for entry in ranked[:_SHORT_POOL_VERIFY_CANDIDATES]:
+        try:
+            if verify_clip_matches_query(entry["path"], verify_query):
+                chosen = entry
+                print(f"    Short rescue clip {index}: long-video clip re-verified for "
+                      f"'{verify_query[:50]}'")
+                break
+        except Exception as e:
+            print(f"    Short rescue clip {index}: pool verification error "
+                  f"({type(e).__name__}: {str(e)[:80]})")
+    if chosen is None:
+        # Still on-topic: already verified against a sentence of this same
+        # script (and woman-filtered) during the long-video render.
+        chosen = ranked[0]
+        print(f"    Short rescue clip {index}: using best-overlap same-video clip "
+              f"(score {_score(chosen):.1f}) from '{chosen['text'][:50]}'")
+
+    with _LONG_POOL_LOCK:
+        _LONG_POOL_USED.setdefault(tag, set()).add(chosen["path"])
+
+    out = TEMP_DIR / f"clip_s{tag}_{index}.mp4"
+    normalized = _normalize_landscape_to_vertical_clip(chosen["path"], out, duration)
+    if normalized and not _normalized_duration_is_usable(normalized, duration):
+        print(f"    Short rescue clip {index}: pool clip duration off-target; accepting anyway")
+    return normalized
+
+
+def _rescue_short_clip(sent, index, tag):
+    """Tiers 2-4 of the Shorts rescue chain. Returns a 1080x1920 clip or None."""
+    duration = max(2.5, sent['end'] - sent['start'])
+    try:
+        queries = _query_attempts(index, sent.get('orig_idx', index))
+    except Exception:
+        queries = []
+
+    # Tier 2: landscape stock for the SAME sentence queries.
+    for round_no in range(_SHORT_LANDSCAPE_ROUNDS):
+        for query in queries:
+            try:
+                clip = _try_short_candidate(query, index, tag, duration, "landscape", round_no + 1)
+            except Exception as e:
+                print(f"    Short rescue clip {index}: landscape candidate error "
+                      f"({type(e).__name__}: {str(e)[:100]})")
+                clip = None
+            if clip:
+                print(f"    Short rescue clip {index}: tier 2 (landscape->vertical) succeeded")
+                return clip
+
+    # Tier 3: fresh sentence-specific Groq queries, both orientations.
+    try:
+        fresh = _request_fresh_sentence_queries(sent.get("text", ""), queries, "portrait")
+    except Exception:
+        fresh = []
+    for query in fresh:
+        for source in ("portrait", "landscape"):
+            try:
+                clip = _try_short_candidate(query, index, tag, duration, source, 1)
+            except Exception as e:
+                print(f"    Short rescue clip {index}: fresh-query candidate error "
+                      f"({type(e).__name__}: {str(e)[:100]})")
+                clip = None
+            if clip:
+                print(f"    Short rescue clip {index}: tier 3 (fresh Groq query, {source}) succeeded")
+                return clip
+
+    # Tier 4: verified same-video footage from the long render.
+    try:
+        clip = _short_clip_from_long_pool(sent, index, tag, duration, queries + list(fresh))
+    except Exception as e:
+        print(f"    Short rescue clip {index}: pool fallback error "
+              f"({type(e).__name__}: {str(e)[:100]})")
+        clip = None
+    if clip:
+        print(f"    Short rescue clip {index}: tier 4 (long-video pool) succeeded")
+    return clip
+
+
 def process_short_clip(args):
     i, sent, tag = args
-    return _find_verified_normalized_clip(sent, i, "portrait", tag)
+    try:
+        return _find_verified_normalized_clip(sent, i, "portrait", tag)
+    except Exception as e:
+        print(f"    Short clip {i}: portrait search exhausted ({str(e)[:100]}); starting rescue")
+    return i, _rescue_short_clip(sent, i, tag)
 
 
 def render_short(short_idx, sentences_slice, audio_path, ass_path, logo_path, out_path,
@@ -1720,10 +1983,18 @@ def render_short(short_idx, sentences_slice, audio_path, ass_path, logo_path, ou
             for i, sent in enumerate(sentences_slice)
         }
         for future in concurrent.futures.as_completed(futures):
-            i, clip = future.result()
+            try:
+                i, clip = future.result()
+            except Exception as e:
+                # A single failed sentence must never abort the whole short
+                # (or, previously, every remaining short in the pipeline).
+                i = futures[future]
+                clip = None
+                print(f"    Short {short_idx+1}: clip {i} worker failed "
+                      f"({type(e).__name__}: {str(e)[:160]})")
             clips[i] = clip
             completed += 1
-            print(f"    Short {short_idx+1}: completed {completed}/{n} exact clips")
+            print(f"    Short {short_idx+1}: completed {completed}/{n} clips")
 
     if release_verifier:
         _release_llava_for_encoding()
@@ -1735,8 +2006,21 @@ def render_short(short_idx, sentences_slice, audio_path, ass_path, logo_path, ou
     missing = [i for i, clip in enumerate(clips)
                if not clip or not os.path.exists(clip)]
     if missing:
-        print(f"  Short {short_idx+1}: missing normalized clips at positions {missing}; refusing substitution")
-        return False
+        # Tier 5: borrow the nearest verified clip from this same short,
+        # re-timed to the missing slot so visuals stay in sync with audio.
+        available = [i for i in range(n) if i not in missing]
+        if not available:
+            print(f"  Short {short_idx+1}: no clips at all after rescue chain; cannot render")
+            return False
+        print(f"  Short {short_idx+1}: substituting nearest verified clip for positions {missing}")
+        for mi in missing:
+            donor = min(available, key=lambda a: abs(a - mi))
+            slot = max(2.5, sentences_slice[mi]['end'] - sentences_slice[mi]['start'])
+            retimed = _normalize_vertical_clip(
+                clips[donor], TEMP_DIR / f"clip_s{tag}_{mi}_nb.mp4", slot
+            )
+            clips[mi] = retimed or clips[donor]
+            print(f"    Short {short_idx+1}: clip {mi} <- neighbor {donor}")
 
     list_path = f"list_{tag}.txt"
     visual_path = f"visual_{tag}.mp4"
@@ -2899,6 +3183,25 @@ def _normalize_vertical_clip(raw_path, output_path, duration):
     )
 
 
+def _normalize_landscape_to_vertical_clip(raw_path, output_path, duration):
+    """Convert a landscape (or any aspect) clip to 1080x1920 for Shorts.
+
+    A plain 9:16 center crop keeps only ~30% of a 16:9 frame and often cuts
+    the subject out. Instead: blurred full-frame background + a 1080x880
+    lightly-zoomed foreground band, the standard native-Shorts look.
+    """
+    vf = (
+        "split=2[bg][fg];"
+        "[bg]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,"
+        "boxblur=10:2,scale=1080:1920,setsar=1[bgb];"
+        "[fg]scale=1080:880:force_original_aspect_ratio=increase,crop=1080:880,setsar=1[fgs];"
+        "[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=30"
+    )
+    return _normalize_clip_with_recovery(
+        raw_path, output_path, duration, vf, "Landscape->vertical normalization"
+    )
+
+
 def _normalized_duration_is_usable(path, target_duration):
     """Reject clips whose encoded duration could create concat timing drift."""
     try:
@@ -3053,6 +3356,10 @@ def render_video(sentences, audio_path, ass_path, logo_path, out_sub, keep_verif
                 55 + int((completed / max(1, n)) * 25),
                 f"Exact clips verified and normalized ({completed}/{n})...",
             )
+
+    # Register verified clips BEFORE neighbor substitution so the Shorts
+    # rescue pool only contains clips verified for their own sentence.
+    _register_long_clip_pool(sentences, clips)
 
     if not keep_verifier:
         _release_llava_for_encoding()
@@ -3789,18 +4096,24 @@ if render_video(sentences, audio, ass, logo, o2, keep_verifier=True):
 
                 saved_query_options = AI_QUERY_OPTIONS
                 AI_QUERY_OPTIONS = short_query_options
+                ok = False
                 try:
                     short_out = OUTPUT_DIR / f"short_{JOB_ID}_{si+1}.mp4"
-                    ok = render_short(
-                        si, short_sentences, short_audio, short_ass, logo, short_out,
-                        release_verifier=False,
-                    )
-                    if not ok:
-                        print(f"  Short {si+1}: retrying once...")
-                        ok = render_short(
-                            si, short_sentences, short_audio, short_ass, logo, short_out,
-                            release_verifier=False,
-                        )
+                    for attempt in range(2):
+                        if attempt:
+                            print(f"  Short {si+1}: retrying once...")
+                        try:
+                            ok = render_short(
+                                si, short_sentences, short_audio, short_ass, logo, short_out,
+                                release_verifier=False,
+                            )
+                        except Exception as e:
+                            # Isolate failures: one broken short must not
+                            # abort the remaining shorts.
+                            print(f"  Short {si+1}: render error ({type(e).__name__}: {str(e)[:160]})")
+                            ok = False
+                        if ok:
+                            break
                 finally:
                     AI_QUERY_OPTIONS = saved_query_options
 
