@@ -432,6 +432,19 @@ _USED_URLS_LOCK = threading.Lock()
 # two independent providers in parallel avoids serial 12-second stalls while
 # still giving each provider enough time for normal network conditions.
 _STOCK_API_TIMEOUT = (3, 5)
+# ------------------------------------------------------------------
+# CLIP DOWNLOAD SAFETY LIMITS (freeze protection)
+# ------------------------------------------------------------------
+# requests' timeout only bounds the connect phase and the gap between received
+# chunks; it does NOT cap total transfer time. A server that trickles one byte
+# just under the read-timeout keeps iter_content alive indefinitely, which can
+# freeze the whole job at 0% CPU/GPU while a worker thread blocks on a dead-slow
+# socket. These two limits bound the worst case: a hard wall-clock deadline for
+# the entire download, and a size ceiling so a mislabeled huge file cannot stall
+# the pipeline either.
+_CLIP_DOWNLOAD_CONNECT_READ_TIMEOUT = (5, 15)  # (connect, read-between-chunks)
+_CLIP_DOWNLOAD_MAX_SECONDS = 45                # hard wall-clock cap per file
+_CLIP_DOWNLOAD_MAX_BYTES = 120 * 1024 * 1024   # 120 MB ceiling per clip
 # Five sentence-aligned stock-query options generated in one unified Groq call.
 # Each entry is [primary, backup_1, backup_2, backup_3, backup_4].
 AI_QUERY_OPTIONS = []
@@ -1598,6 +1611,55 @@ def _search_stock_urls(query, page, orientation, limit=None):
     return urls
 
 
+def _download_clip_to_file(url, dest_path):
+    """Download `url` to `dest_path` with a hard wall-clock deadline.
+
+    Returns True on success, False on any failure (timeout, deadline exceeded,
+    size ceiling exceeded, network error). On failure the partial file is
+    removed. This is the single choke point that guarantees no clip download
+    can hang the pipeline: even if the connect/read timeout never trips because
+    a server trickles bytes, the elapsed-time check aborts the transfer.
+    """
+    started = time.perf_counter()
+    bytes_written = 0
+    response = None
+    try:
+        response = requests.get(
+            url, timeout=_CLIP_DOWNLOAD_CONNECT_READ_TIMEOUT, stream=True
+        )
+        with open(dest_path, "wb") as f:
+            for chunk in response.iter_content(8192):
+                if not chunk:
+                    continue
+                # Hard wall-clock cap: a slow-trickle server never trips the
+                # per-chunk read timeout, so bound the whole transfer here.
+                if time.perf_counter() - started > _CLIP_DOWNLOAD_MAX_SECONDS:
+                    raise TimeoutError(
+                        f"download exceeded {_CLIP_DOWNLOAD_MAX_SECONDS}s wall-clock cap"
+                    )
+                f.write(chunk)
+                bytes_written += len(chunk)
+                if bytes_written > _CLIP_DOWNLOAD_MAX_BYTES:
+                    raise OSError(
+                        f"download exceeded {_CLIP_DOWNLOAD_MAX_BYTES} byte ceiling"
+                    )
+        return True
+    except Exception as e:
+        print(f"    Clip download aborted ({type(e).__name__}: {str(e)[:100]})")
+        try:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+        except OSError:
+            pass
+        return False
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+
 def search_and_download_vertical(query, idx, duration, tag="", verify=True, normalize=True, page=1):
     """
     Same as search_and_download but requests portrait/vertical source video
@@ -1613,10 +1675,8 @@ def search_and_download_vertical(query, idx, duration, tag="", verify=True, norm
         try:
             raw = TEMP_DIR / f"raw_s{tag}_{idx}.mp4"
             out = TEMP_DIR / f"clip_s{tag}_{idx}.mp4"
-            r = requests.get(url, timeout=25, stream=True)
-            with open(raw,"wb") as f:
-                for chunk in r.iter_content(8192):
-                    if chunk: f.write(chunk)
+            if not _download_clip_to_file(url, raw):
+                continue
             if os.path.getsize(raw) < 5000:
                 try: os.remove(raw)
                 except OSError: pass
@@ -3264,10 +3324,8 @@ def search_and_download(query, idx, duration, verify=True, page=1):
             raw = TEMP_DIR / f"raw_{idx}.mp4"
             out = TEMP_DIR / f"clip_{idx}.mp4"
             download_started = time.perf_counter()
-            r = requests.get(url, timeout=25, stream=True)
-            with open(raw,"wb") as f:
-                for chunk in r.iter_content(8192):
-                    if chunk: f.write(chunk)
+            if not _download_clip_to_file(url, raw):
+                continue
             download_seconds = time.perf_counter() - download_started
             if os.path.getsize(raw) < 5000:
                 try: os.remove(raw)
@@ -3338,24 +3396,47 @@ def render_video(sentences, audio_path, ass_path, logo_path, out_sub, keep_verif
 
     completed = 0
     update_status(55, f"Finding exact verified clips (0/{n})...")
+    # Hard ceiling for the entire landscape clip-search phase. Workers already
+    # bound their own downloads and ffmpeg subprocesses, but as_completed with
+    # no timeout turns a single wedged worker (e.g. a stuck native call) into a
+    # permanent job freeze at 0% CPU/GPU. Any future still unfinished when this
+    # deadline passes is abandoned and treated as a missing clip, which the
+    # neighbor-substitution path below already recovers from.
+    _CLIP_PHASE_TIMEOUT_SECONDS = max(
+        600, n * _CLIP_QUERY_ROUNDS * (_CLIP_DOWNLOAD_MAX_SECONDS + 60)
+    )
+    _phase_started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
         futures = {
             ex.submit(process_landscape_clip, (i, sent, None)): i
             for i, sent in enumerate(sentences)
         }
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                i, clip = future.result()
-                clips[i] = clip
-            except Exception as e:
-                i = futures[future]
-                print(f"  Clip {i} worker failed: {type(e).__name__}: {str(e)[:160]}")
-                clips[i] = None
-            completed += 1
-            update_status(
-                55 + int((completed / max(1, n)) * 25),
-                f"Exact clips verified and normalized ({completed}/{n})...",
-            )
+        try:
+            for future in concurrent.futures.as_completed(
+                futures, timeout=_CLIP_PHASE_TIMEOUT_SECONDS
+            ):
+                try:
+                    i, clip = future.result()
+                    clips[i] = clip
+                except Exception as e:
+                    i = futures[future]
+                    print(f"  Clip {i} worker failed: {type(e).__name__}: {str(e)[:160]}")
+                    clips[i] = None
+                completed += 1
+                update_status(
+                    55 + int((completed / max(1, n)) * 25),
+                    f"Exact clips verified and normalized ({completed}/{n})...",
+                )
+        except concurrent.futures.TimeoutError:
+            # One or more workers never returned within the phase deadline.
+            # Cancel what we can, log which clips were left unfinished, and let
+            # the missing-clip recovery below substitute neighbors for them.
+            stuck = [idx for fut, idx in futures.items() if not fut.done()]
+            elapsed = time.perf_counter() - _phase_started
+            print(f"  Clip search phase hit {_CLIP_PHASE_TIMEOUT_SECONDS}s deadline "
+                  f"after {elapsed:.0f}s; abandoning {len(stuck)} unfinished clip(s): {stuck}")
+            for fut in futures:
+                fut.cancel()
 
     # Register verified clips BEFORE neighbor substitution so the Shorts
     # rescue pool only contains clips verified for their own sentence.
@@ -3371,15 +3452,36 @@ def render_video(sentences, audio_path, ass_path, logo_path, out_sub, keep_verif
     missing = [i for i, clip in enumerate(clips)
                if not clip or not os.path.exists(clip)]
     if missing:
-        # Allow neighbor substitution for up to 25% missing clips instead of
-        # aborting entirely. Each missing position borrows the nearest verified
-        # neighbor — this keeps the video length correct while only duplicating
-        # a small fraction of visuals. Still FATAL if more than 25% failed.
-        max_allowed_missing = max(3, int(n * 0.25))
-        if len(missing) > max_allowed_missing:
-            print(f"  FATAL: {len(missing)} clips were not verified/normalized "
-                  f"(>{max_allowed_missing} limit): {missing[:20]}; aborting")
+        # Each missing position borrows the nearest verified neighbor clip.
+        # This keeps the video length EXACTLY correct and only duplicates a
+        # fraction of visuals. A substituted clip is still a MiniCPM-verified
+        # clip (just verified for an adjacent sentence of the same script),
+        # so this never introduces an unsafe/unverified visual - it is the
+        # same guarantee the Shorts "reuse a verified long-video clip" tier
+        # already relies on.
+        #
+        # Longer videos (30-35 min => ~230 sentences) legitimately contain
+        # more abstract/metaphorical sentences ("defended hope icon",
+        # "secure future lock") for which no literal stock clip ever passes
+        # verification across all query rounds. Those sentences MUST fall back
+        # to a verified neighbor rather than failing the whole render. We only
+        # abort when the failure is clearly systemic (the vast majority of
+        # clips failed, e.g. no API access / verifier down) - in that case a
+        # mostly-duplicated video would be worthless anyway.
+        verified_count = n - len(missing)
+        systemic_failure_limit = max(3, int(n * 0.60))
+        if verified_count == 0:
+            print(f"  FATAL: no clips were verified at all ({len(missing)}/{n} missing); "
+                  f"nothing to substitute from; aborting")
             return False
+        if len(missing) > systemic_failure_limit:
+            print(f"  FATAL: {len(missing)}/{n} clips failed verification "
+                  f"(> {systemic_failure_limit} systemic-failure limit): {missing[:20]}; "
+                  f"this indicates a broken verifier or provider, aborting")
+            return False
+        if len(missing) > max(3, int(n * 0.25)):
+            print(f"  NOTICE: {len(missing)}/{n} clips unverified (above the usual 25% band) - "
+                  f"recovering via verified-neighbor substitution rather than failing the render")
         print(f"  WARNING: {len(missing)} clips missing; substituting nearest verified neighbor "
               f"for positions {missing[:20]}")
         for mi in missing:
@@ -3396,6 +3498,8 @@ def render_video(sentences, audio_path, ass_path, logo_path, out_sub, keep_verif
                 clips[mi] = clips[best]
                 print(f"    Clip {mi} <- neighbor {best}")
             else:
+                # Unreachable in practice: verified_count > 0 was asserted
+                # above, so at least one valid clip always exists to borrow.
                 print(f"    Clip {mi}: no neighbor available; aborting")
                 return False
     
@@ -3609,6 +3713,78 @@ _YOUTUBE_TOKEN_MAP = {
     "techrovex": "token-techrovex.json",
     "vitovia": "token-vitovia.json",
 }
+
+# ------------------------------------------------------------------
+# PER-CHANNEL BRAND ASSETS (logo + voice) FROM KAGGLE DATASETS
+# ------------------------------------------------------------------
+# The logos and voice samples live in dedicated Kaggle datasets attached to the
+# kernel (see dataset_sources in the workflow), so the web UI never has to
+# re-upload the logo and voice sample on every run. Each channel maps to the
+# filename inside those datasets:
+#   logos dataset  (mudassool746/logoos):  logo-techrovex.png, logo-vitovia.png
+#   voices dataset (mudassool746/audioss): audio-techrovex.mp3, audio-vitovia.mp3
+_CHANNEL_LOGO_MAP = {
+    "techrovex": "logo-techrovex.png",
+    "vitovia": "logo-vitovia.png",
+}
+# List every accepted filename spelling per channel; the finder returns the
+# first that exists. Both hyphen and underscore separators are accepted so a
+# dataset reupload with a slightly different name still resolves.
+_CHANNEL_VOICE_MAP = {
+    "techrovex": ["audio-techrovex.mp3", "audio_techrovex.mp3",
+                  "voice-techrovex.mp3", "voice_techrovex.mp3"],
+    "vitovia": ["audio-vitovia.mp3", "audio_vitovia.mp3",
+                "voice-vitovia.mp3", "voice_vitovia.mp3"],
+}
+
+
+def _find_kaggle_asset(filename):
+    """Locate a brand asset inside /kaggle/input, mirroring token discovery.
+
+    Kaggle mounts each dataset under a slug-derived folder that may differ from
+    the raw dataset name, so a recursive scan is the only reliable lookup. Also
+    checks the local working directory for offline testing. Returns a Path or
+    None.
+    """
+    if not filename:
+        return None
+
+    kaggle_input = Path("/kaggle/input")
+    if kaggle_input.is_dir():
+        try:
+            for found in kaggle_input.rglob(filename):
+                if found.is_file():
+                    print(f"  Asset: found '{filename}' at {found}")
+                    return found
+        except Exception as e:
+            print(f"  Asset: error scanning /kaggle/input for '{filename}' ({e})")
+
+    local = Path(filename)
+    if local.exists():
+        print(f"  Asset: found '{filename}' at {local}")
+        return local
+
+    print(f"  Asset: '{filename}' not found in /kaggle/input or working dir")
+    return None
+
+
+def _resolve_channel_logo(channel):
+    """Return a local path to the channel's logo from the Kaggle logos dataset."""
+    found = _find_kaggle_asset(_CHANNEL_LOGO_MAP.get(channel))
+    return found if found else None
+
+
+def _resolve_channel_voice(channel):
+    """Return a local path to the channel's voice sample from the voices dataset.
+
+    Tries each accepted filename spelling for the channel in order.
+    """
+    for candidate in _CHANNEL_VOICE_MAP.get(channel, []):
+        found = _find_kaggle_asset(candidate)
+        if found:
+            return found
+    return None
+
 
 def _download_youtube_token(channel):
     """Locate the YouTube token file from Kaggle input datasets or local directory."""
@@ -3872,12 +4048,54 @@ print(f"{'='*50}\n")
 
 update_status(1, "Starting...")
 voice = TEMP_DIR/"voice.mp3"; logo = TEMP_DIR/"logo.png"
-if not download_asset(VOICE_PATH, voice):
-    update_status(0,"Voice failed","failed"); exit(1)
-if LOGO_PATH and LOGO_PATH != "None":
-    download_asset(LOGO_PATH, logo)
-    logo = str(logo) if os.path.exists(logo) else None
-else: logo = None
+
+# A channel selection means the brand voice + logo already live in the Kaggle
+# logos/voices datasets attached to this kernel, so the web UI does not have to
+# re-upload them every run. Resolve per-channel assets from Kaggle first and
+# only fall back to the GitHub-uploaded path when no channel asset is found.
+_channel = YOUTUBE_CHANNEL.strip().lower()
+
+# --- VOICE ---
+_voice_ready = False
+if _channel and _channel != "none":
+    channel_voice = _resolve_channel_voice(_channel)
+    if channel_voice:
+        try:
+            shutil.copy2(str(channel_voice), str(voice))
+            _voice_ready = os.path.exists(voice) and os.path.getsize(voice) > 1000
+            if _voice_ready:
+                print(f"  Voice: using channel '{_channel}' sample from Kaggle dataset "
+                      f"({channel_voice.name})")
+        except Exception as e:
+            print(f"  Voice: failed to copy channel asset ({e}); falling back to upload")
+if not _voice_ready:
+    if VOICE_PATH and VOICE_PATH != "None" and download_asset(VOICE_PATH, voice):
+        _voice_ready = os.path.exists(voice) and os.path.getsize(voice) > 1000
+        if _voice_ready:
+            print("  Voice: using uploaded voice sample from GitHub")
+if not _voice_ready:
+    update_status(0, "Voice failed", "failed"); exit(1)
+
+# --- LOGO ---
+logo = None
+if _channel and _channel != "none":
+    channel_logo = _resolve_channel_logo(_channel)
+    if channel_logo:
+        try:
+            shutil.copy2(str(channel_logo), str(TEMP_DIR / "logo.png"))
+            if os.path.exists(TEMP_DIR / "logo.png"):
+                logo = str(TEMP_DIR / "logo.png")
+                print(f"  Logo: using channel '{_channel}' logo from Kaggle dataset "
+                      f"({channel_logo.name})")
+        except Exception as e:
+            print(f"  Logo: failed to copy channel asset ({e}); falling back to upload")
+if logo is None and LOGO_PATH and LOGO_PATH != "None":
+    download_asset(LOGO_PATH, TEMP_DIR / "logo.png")
+    logo = str(TEMP_DIR / "logo.png") if os.path.exists(TEMP_DIR / "logo.png") else None
+    if logo:
+        print("  Logo: using uploaded logo from GitHub")
+if logo is None:
+    print("  Logo: none resolved for this channel/upload; continuing without a logo overlay")
 
 # Script
 update_status(5, "Script...")
