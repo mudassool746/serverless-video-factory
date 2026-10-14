@@ -123,7 +123,7 @@ jobs:
             "is_private": "true",
             "enable_gpu": "true",
             "enable_internet": "true",
-            "dataset_sources": ["mudassool746/tokens"],
+            "dataset_sources": ["mudassool746/tokens", "mudassool746/logoos", "mudassool746/audioss"],
             "kernel_sources": [],
             "competition_sources": []
           }' > kernel-metadata.json
