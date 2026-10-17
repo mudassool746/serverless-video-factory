@@ -3542,11 +3542,16 @@ def render_video(sentences, audio_path, ass_path, logo_path, out_sub, keep_verif
     adur = _probe_dur(audio_path)
     if vdur > 0 and adur > 0 and vdur < adur - 0.5:
         print(f"  Concatenated visual is {adur - vdur:.2f}s short; re-encoding with NVENC to recover GOP rounding")
+        # These re-encodes cover the WHOLE visual track, so their timeouts must
+        # scale with video length. Fixed 180s/600s caps killed the recovery on
+        # a 30-35 min video (seen in logs), leaving the deficit unrecovered.
+        _reencode_nvenc_timeout = max(300, int(adur * 2))
+        _reencode_cpu_timeout = max(600, int(adur * 8))
         # Use GPU encoding (NVENC) instead of CPU libx264 to avoid 300s+ timeouts
         reencode_cmd = (["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "list.txt"]
                         + _enc_args() + ["-an", "visual_reencoded.mp4"])
         try:
-            subprocess.run(reencode_cmd, capture_output=True, timeout=180)
+            subprocess.run(reencode_cmd, capture_output=True, timeout=_reencode_nvenc_timeout)
         except subprocess.TimeoutExpired:
             # NVENC failed or timed out, try CPU with longer timeout
             print("  NVENC re-encode timed out, trying CPU fallback...")
@@ -3554,7 +3559,7 @@ def render_video(sentences, audio_path, ass_path, logo_path, out_sub, keep_verif
                 subprocess.run(
                     ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "list.txt",
                      "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-an", "visual_reencoded.mp4"],
-                    capture_output=True, timeout=600,
+                    capture_output=True, timeout=_reencode_cpu_timeout,
                 )
             except subprocess.TimeoutExpired:
                 print("  CPU re-encode also timed out; continuing with stream-copy visual")
@@ -3603,6 +3608,21 @@ def render_video(sentences, audio_path, ass_path, logo_path, out_sub, keep_verif
         maps = ["-map", "[v]", "-map", "[a]"]
 
     encoders = []
+    # Final-render timeouts must scale with the video's real length. Burning
+    # word-level subtitles (libass) + logo overlay is CPU-bound frame-by-frame
+    # work even on the NVENC path, so a fixed 300s/1800s cap that is fine for a
+    # 10-min video kills a 30-35 min render mid-encode (the exact failure seen
+    # in logs: NVENC killed at 300s, CPU libx264 killed at 1800s). Derive each
+    # cap from the audio duration with a generous multiplier and a safe floor.
+    _render_seconds = adur if adur and adur > 0 else _probe_dur("visual.mp4")
+    if not _render_seconds or _render_seconds <= 0:
+        _render_seconds = 600.0
+    # NVENC encodes well faster than real time, but libass subtitle compositing
+    # is the slow part, so allow ~3x realtime with a 600s floor.
+    _nvenc_timeout = max(600, int(_render_seconds * 3))
+    # CPU libx264 with subtitle burn-in can run several times slower than
+    # real time on a shared Kaggle vCPU; allow ~12x realtime with a 1800s floor.
+    _cpu_timeout = max(1800, int(_render_seconds * 12))
     if USE_GPU:
         # Do not request CUDA decode here. Subtitle rendering is CPU-side and
         # the already-normalized input needs no GPU scaling; keeping decode
@@ -3610,8 +3630,10 @@ def render_video(sentences, audio_path, ass_path, logo_path, out_sub, keep_verif
         encoders.append(("NVENC", [
             "-c:v", "h264_nvenc", "-preset", "p4",
             "-b:v", "8M", "-maxrate", "10M", "-bufsize", "16M",
-        ], 300))
-    encoders.append(("CPU fallback", ["-c:v", "libx264", "-preset", "fast", "-crf", "18"], 1800))
+        ], _nvenc_timeout))
+    encoders.append(("CPU fallback", ["-c:v", "libx264", "-preset", "fast", "-crf", "18"], _cpu_timeout))
+    print(f"  Final render timeouts: NVENC={_nvenc_timeout}s, CPU={_cpu_timeout}s "
+          f"(video ~{_render_seconds:.0f}s)")
 
     partial_out = Path(str(out_sub) + ".part.mp4")
     for encoder_name, encoder_args, timeout_seconds in encoders:
