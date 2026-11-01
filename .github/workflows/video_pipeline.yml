@@ -4,6 +4,18 @@ on:
   repository_dispatch:
     types: [trigger-video]
 
+# Only one Kaggle run at a time. The whole pipeline pushes to a SINGLE shared
+# kernel id (<user>/video-factory-titan), and Kaggle runs only one version of a
+# kernel at a time per account with limited GPU slots. Without this, two
+# triggers (or a rapid re-trigger) each run `kaggle kernels push` against the
+# same kernel and fight for the one GPU slot, so the newer push sits in
+# "queued" behind the older one - the "queued again and again" symptom. This
+# serializes runs; a new trigger waits for the in-flight run to finish rather
+# than stacking another queued push on top of it.
+concurrency:
+  group: kaggle-video-factory
+  cancel-in-progress: false
+
 jobs:
   run-video-factory:
     runs-on: ubuntu-latest
@@ -20,7 +32,13 @@ jobs:
           python-version: '3.11'
 
       - name: Install Kaggle API
-        run: pip install kaggle==2.2.4
+        # kaggle 2.2.4 imports `six` (kaggle/models/upload_file.py) but does not
+        # declare it as a dependency, so the CLI crashes on import with
+        # "ModuleNotFoundError: No module named 'six'" unless it is installed too.
+        # Also verify the CLI imports so a broken install fails here, not later.
+        run: |
+          pip install kaggle==2.2.4 six==1.17.0
+          kaggle --version
 
       - name: Build & Push to Kaggle
         env:
@@ -135,19 +153,53 @@ jobs:
       - name: Wait for Result (Long Polling)
         run: |
           echo "Polling Kaggle (Timeout: 6 Hours)..."
+          # A freshly pushed kernel sits in "queued" until a GPU slot is free.
+          # That is normal for the first few minutes, but if it never leaves the
+          # queue it means the GPU is busy with another session or the weekly
+          # GPU quota is exhausted - in that case polling for 6 hours is
+          # pointless. Bound the time the kernel is allowed to stay queued
+          # WITHOUT ever having started running, and fail fast with a clear
+          # message so the run does not silently hang.
+          QUEUE_STALL_LIMIT=25      # minutes allowed in pure-queued state
+          queued_minutes=0
+          ever_running=0
           for i in {1..360}; do
-            OUTPUT=$(kaggle kernels status ${{ secrets.KAGGLE_USERNAME }}/video-factory-titan)
+            OUTPUT=$(kaggle kernels status ${{ secrets.KAGGLE_USERNAME }}/video-factory-titan 2>&1)
             echo "$OUTPUT"
-            
-            if [[ "$OUTPUT" == *"complete"* ]]; then
+
+            if echo "$OUTPUT" | grep -qi "complete"; then
               echo "✅ Kernel finished successfully!"
               break
-            elif [[ "$OUTPUT" == *"error"* ]]; then
+            elif echo "$OUTPUT" | grep -qi "error"; then
               echo "❌ Kernel failed! Check Kaggle logs."
               exit 1
+            elif echo "$OUTPUT" | grep -qi "cancel"; then
+              echo "❌ Kernel was cancelled (cancelRequested/cancelAcknowledged)."
+              exit 1
+            elif echo "$OUTPUT" | grep -qi "running"; then
+              ever_running=1
+              queued_minutes=0
+              echo "Rendering... (Minute $i/360)"
+            elif echo "$OUTPUT" | grep -qi "queued"; then
+              # Still waiting for a GPU slot.
+              if [ "$ever_running" -eq 0 ]; then
+                queued_minutes=$((queued_minutes + 1))
+                echo "Queued, waiting for a GPU slot... (${queued_minutes}/${QUEUE_STALL_LIMIT} min queued)"
+                if [ "$queued_minutes" -ge "$QUEUE_STALL_LIMIT" ]; then
+                  echo "❌ Kernel stuck in 'queued' for ${QUEUE_STALL_LIMIT} min without starting."
+                  echo "   Likely cause: a previous GPU session is still running, or the weekly"
+                  echo "   GPU quota is exhausted. Stopping instead of burning the 6h budget."
+                  echo "   Fix: wait for the other session to finish / for quota to reset, then re-trigger."
+                  exit 1
+                fi
+              else
+                # It ran before and is now re-queued (rare); keep waiting.
+                echo "Re-queued after running... (Minute $i/360)"
+              fi
+            else
+              echo "Status not recognized yet... (Minute $i/360)"
             fi
-            
-            echo "Rendering... (Minute $i/360)"
+
             sleep 60
           done
 
