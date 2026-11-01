@@ -37,7 +37,7 @@ jobs:
         # "ModuleNotFoundError: No module named 'six'" unless it is installed too.
         # Also verify the CLI imports so a broken install fails here, not later.
         run: |
-          pip install kaggle==2.2.4 six==1.17.0
+          pip install kaggle==2.2.5 six==1.17.0
           kaggle --version
 
       - name: Build & Push to Kaggle
